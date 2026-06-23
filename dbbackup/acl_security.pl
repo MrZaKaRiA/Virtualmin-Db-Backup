@@ -1,0 +1,28 @@
+# acl_security.pl
+# Per-user access control for the Database Backup module. Admins can grant or
+# deny each capability independently via Webmin Users -> (user) -> Database Backup.
+
+do './dbbackup-lib.pl';
+
+my @acl_keys = qw(view backup restore profiles remotes schedule delete);
+
+# acl_security_form(&access) - render the ACL editing form.
+sub acl_security_form
+{
+my ($access) = @_;
+foreach my $k (@acl_keys) {
+	my $val = defined($access->{$k}) ? $access->{$k} : 1;
+	print &ui_table_row($text{'acl_'.$k}, &ui_yesno_radio($k, $val));
+	}
+}
+
+# acl_security_save(&access, &in) - persist the submitted ACL values.
+sub acl_security_save
+{
+my ($access, $in) = @_;
+foreach my $k (@acl_keys) {
+	$access->{$k} = $in->{$k};
+	}
+}
+
+1;

@@ -1,0 +1,22 @@
+Backup destination,11
+backup_dir=Default backup directory,0
+free_space_mb=Abort a backup if free space falls below (MB),3,512
+Retention,11
+retain_count=Keep at most this many backup sets per destination (0 = unlimited),3,14
+retain_days=Also delete backup sets older than this many days (0 = disabled),3,30
+Dump options,11
+compression=Compression,1,gzip-gzip,zstd-zstd,xz-xz,none-None
+compress_level=Compression level (1-9; blank = tool default),3,6
+single_transaction=Use a consistent snapshot for MySQL/MariaDB (--single-transaction)?,1,1-Yes,0-No
+include_routines=Include routines, triggers and events for MySQL/MariaDB?,1,1-Yes,0-No
+exclude_dbs=System databases to skip (space separated),0
+checksum=Write SHA-256 checksums for every backup file?,1,1-Yes,0-No
+encrypt=Encrypt backups at rest with GnuPG (passphrase set per job)?,1,1-Yes,0-No
+Cloud upload,11
+default_remote=Default rclone remote for uploads (blank = none),0
+remote_mode=Upload mode,1,copy-Copy (never deletes on remote),sync-Sync (mirror, may delete on remote)
+remote_base=Base folder/path on the remote,0
+Behaviour,11
+confirm_destructive=Confirm before destructive actions (restore / delete)?,1,1-Yes,0-No
+log_lines=Default number of log lines to show,3,200
+docker_context=Docker context override (blank = default),0

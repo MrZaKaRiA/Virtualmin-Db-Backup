@@ -1,0 +1,17 @@
+backup_dir=/var/backups/databases
+retain_count=14
+retain_days=30
+compression=gzip
+compress_level=6
+single_transaction=1
+include_routines=1
+exclude_dbs=information_schema performance_schema sys
+checksum=1
+encrypt=0
+default_remote=
+remote_mode=copy
+remote_base=database-backups
+confirm_destructive=1
+docker_context=
+log_lines=200
+free_space_mb=512

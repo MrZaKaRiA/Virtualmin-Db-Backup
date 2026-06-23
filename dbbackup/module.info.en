@@ -1,0 +1,2 @@
+desc=Database Backup
+longdesc=Back up MySQL, MariaDB, PostgreSQL, MongoDB and SQLite databases (host-installed or inside Docker containers), with compression, integrity checksums, retention, optional encryption, cloud upload (S3 / Dropbox / Google Drive via rclone) and scheduled jobs.
