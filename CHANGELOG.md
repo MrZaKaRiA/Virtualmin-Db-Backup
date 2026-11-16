@@ -2,6 +2,14 @@
 
 All notable changes to the Database Backup Webmin module are documented here.
 
+## [1.1.0] — 2026-11-16
+
+- Add scheduled daily backup folders grouped by project domain, with Virtualmin
+  database mappings and optional connection-level domain overrides.
+- Write SQLite SQL dumps for daily backups and support SQLite inside Docker.
+- Publish complete local daily sets atomically and verify daily cloud copies.
+- Browse, download, and verify files inside project folders.
+
 ## [1.0.0] — 2026-06-23
 
 Initial release. A hardened, modular successor to the classic

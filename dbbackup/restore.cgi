@@ -4,7 +4,7 @@
 require './dbbackup-lib.pl';
 &ReadParse();
 
-our (%config, %text, %in, %access, %ENGINE_LABEL);
+our (%config, %text, %in, %access, %ENGINE_LABEL, $DAILY_RE);
 %access = &get_module_acl();
 &can('restore') || &error($text{'err_noperm'});
 
@@ -24,14 +24,9 @@ if (!@profiles) {
 my $dir = $config{'backup_dir'};
 my @fileopts;
 foreach my $s (&list_backup_sets($dir)) {
-	opendir(my $dh, $s->{'path'}) || next;
-	foreach my $fn (sort readdir($dh)) {
-		next if ($fn !~ /^[A-Za-z0-9]/);
-		next if ($fn =~ /^(SHA256SUMS|manifest\.json|backup\.log)$/);
-		next if (!-f "$s->{'path'}/$fn");
+	foreach my $fn (&backup_files($s->{'path'}, $s->{'name'} =~ $DAILY_RE)) {
 		push(@fileopts, [ "$s->{'path'}/$fn", "$s->{'name'} / $fn" ]);
 		}
-	closedir($dh);
 	}
 
 print &ui_alert_box($text{'restore_warning'}, 'warn');

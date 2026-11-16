@@ -14,7 +14,7 @@ require './dbbackup-lib.pl';
 &ReadParse();
 &error_setup($text{'err_actionfailed'});
 
-our (%config, %text, %in, %access);
+our (%config, %text, %in, %access, %ENGINE_DUMP, $STAMP_RE);
 %access = &get_module_acl();
 
 $ENV{'REQUEST_METHOD'} eq 'POST' || &error($text{'err_post'});
@@ -153,6 +153,7 @@ elsif ($c eq 'save_profile') {
 		'password'     => $pass,
 		'socket'       => $in{'socket'},
 		'auth_db'      => $in{'auth_db'},
+		'project_domain' => $in{'project_domain'},
 		'sqlite_paths' => join("\t", &sqlite_fields()),
 		'desc'         => $in{'desc'},
 		);
@@ -270,7 +271,8 @@ elsif ($c eq 'upload_set') {
 	my $set = $in{'set'};
 	$set =~ $STAMP_RE || &redir("browse.cgi", undef, $text{'err_badpath'});
 	&get_remote($in{'remote'}) || &redir("browse.cgi?set=".&urlize($set), undef, $text{'err_badname'});
-	my $setdir = $config{'backup_dir'}."/".$set;
+	my $setdir = &backup_set_path($config{'backup_dir'}, $set);
+	$setdir || &redir("browse.cgi", undef, $text{'err_badpath'});
 	my ($f, $o) = &rclone_upload($setdir, $set, $in{'remote'},
 		$config{'remote_base'}, $config{'remote_mode'});
 	&webmin_log("upload", "set", $set, { 'remote' => $in{'remote'} }) if (!$f);
@@ -356,6 +358,7 @@ elsif ($c eq 'save_schedule') {
 	&cron::parse_times_input(\%job, \%in);
 	my %s = (
 		'id'           => $id,
+		'layout'       => ($in{'layout'} || '') eq 'daily' ? 'daily' : 'timestamped',
 		'profiles'     => join("\t", @pids),
 		'dir'          => $in{'dir'},
 		'compression'  => $in{'compression'},

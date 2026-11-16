@@ -61,7 +61,7 @@ else {
 print &ui_hr();
 print &ui_subheading($text{'prof_detected'});
 my $engines = &host_engines();
-my ($dcfail, $dcons) = &docker_db_containers();
+my ($dcfail, $dcons) = &docker_db_containers(1);
 my @drows;
 foreach my $eng (sort keys %$engines) {
 	if ($eng eq 'sqlite') {
@@ -78,6 +78,7 @@ foreach my $eng (sort keys %$engines) {
 		&post_link("import_profile", { 'type' => $eng, 'source' => 'host' }, $text{'prof_det_import'}) ]);
 	}
 foreach my $cc (@{$dcons || []}) {
+	next if (!$cc->{'engine'});
 	push(@drows, [ &html_escape($ENGINE_LABEL{$cc->{'engine'}} || $cc->{'engine'}),
 		&text('detect_docker', &html_escape($cc->{'name'})),
 		"<tt>".&html_escape($cc->{'image'})."</tt>",
@@ -127,7 +128,8 @@ print &ui_table_row($text{'prof_source'},
 	&ui_radio("source", $d{'source'} || 'host',
 		[ [ "host", $text{'prof_src_host'} ], [ "docker", $text{'prof_src_docker'} ] ]));
 
-my @contopts = map { [ $_->{'name'}, $_->{'name'}." (".$ENGINE_LABEL{$_->{'engine'}}.")" ] } @{$dcons || []};
+my @contopts = map { [ $_->{'name'}, $_->{'name'}.
+	($_->{'engine'} ? " (".$ENGINE_LABEL{$_->{'engine'}}.")" : "") ] } @{$dcons || []};
 if (@contopts) {
 	# Pick from the running database containers we detected (add-if-missing keeps
 	# a prefilled but currently-stopped container selectable).
@@ -175,6 +177,9 @@ $sqhtml .= "<script>var dbbSqliteShown=$visible,dbbSqliteTotal=$total;".
 	"if(r){r.style.display='';dbbSqliteShown++;}".
 	"if(dbbSqliteShown>=dbbSqliteTotal){var b=document.getElementById('sqaddbtn');if(b){b.style.display='none';}}}</script>";
 print &ui_table_row($text{'prof_sqlite'}, $sqhtml);
+print &ui_table_row($text{'prof_project_domain'},
+	&ui_textbox("project_domain", $d{'project_domain'} || "", 40)."<br><small>".
+	$text{'prof_project_domain_hint'}."</small>");
 print &ui_table_row($text{'prof_desc'}, &ui_textbox("desc", $d{'desc'} || "", 40));
 
 print &ui_table_end();

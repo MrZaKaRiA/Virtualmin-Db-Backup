@@ -92,6 +92,10 @@ else {
 
 print &ui_table_row($text{'opt_dir'},
 	&ui_textbox("dir", $d{'dir'} || $config{'backup_dir'}, 50)." ".&file_chooser_button("dir", 1));
+print &ui_table_row($text{'sched_layout'},
+	&ui_select("layout", $d{'layout'} || 'timestamped',
+		[ [ 'timestamped', $text{'sched_layout_timestamped'} ], [ 'daily', $text{'sched_layout_daily'} ] ]).
+	"<br><small>".$text{'sched_layout_hint'}."</small>");
 print &ui_table_row($text{'opt_compression'},
 	&ui_select("compression", $d{'compression'} || $config{'compression'},
 		[ [ "gzip", "gzip" ], [ "zstd", "zstd" ], [ "xz", "xz" ], [ "none", $text{'opt_none'} ] ]).

@@ -39,6 +39,8 @@ use warnings;
 use WebminCore;
 use POSIX qw(strftime);
 use File::Copy qw(move copy);
+use File::Temp ();
+use Fcntl qw(:DEFAULT :flock);
 
 init_config();
 
@@ -275,6 +277,7 @@ return undef;
 # like a database, each { id, name, image, engine }.
 sub docker_db_containers
 {
+my ($include_other) = @_;
 return (0, []) if (!&docker_available());
 my ($f, $out, $err) = &run_cmd(
 	&docker_bin().&context_flag().' ps --no-trunc --format "{{json .}}"', undef, 1);
@@ -286,7 +289,7 @@ foreach my $line (split(/\r?\n/, $out)) {
 	my $o = eval { JSON::PP::decode_json($line) };
 	next if (!$o || ref($o) ne 'HASH');
 	my $eng = &guess_engine($o->{'Image'});
-	next if (!$eng);
+	next if (!$eng && !$include_other);
 	push(@list, {
 		'id'     => $o->{'ID'},
 		'name'   => $o->{'Names'},
@@ -348,6 +351,9 @@ $ENGINE_DUMP{$p->{'type'}} || return (1, "Unknown database type");
 my $src = $p->{'source'} || 'host';
 $src eq 'host' || $src eq 'docker' || return (1, "Invalid source");
 &valid_secret($p->{'password'}) || return (1, "Password may not contain newlines");
+if ($p->{'project_domain'} && !&valid_project_domain($p->{'project_domain'})) {
+	return (1, "Invalid project domain or subdomain");
+	}
 if ($src eq 'docker') {
 	&is_valid_ref($p->{'container'}) || return (1, "Invalid or missing container");
 	}
@@ -685,7 +691,7 @@ return &docker_bin().&context_flag().' exec -i '.&sq($p->{'container'}).' /bin/s
 # dump_one(\%p, $db, $rawfile) -> ($failed, $errtext)
 sub dump_one
 {
-my ($p, $db, $raw) = @_;
+my ($p, $db, $raw, $sqlite_sql) = @_;
 my $eng = $p->{'type'};
 my $src = $p->{'source'} || 'host';
 
@@ -777,13 +783,34 @@ if ($eng eq 'mongodb') {
 		}
 	}
 
-# ---- SQLite (host file; "db" is the file path) ----
+# ---- SQLite (the database name is a file path on the selected source) ----
 if ($eng eq 'sqlite') {
 	&valid_abs_path($db) || return (1, "Invalid SQLite path");
 	# Only back up files the profile actually declares (defends against a
 	# crafted db_<id> selection asking for an arbitrary host file).
 	my %ok = map { $_ => 1 } grep { $_ ne '' } split(/\t/, $p->{'sqlite_paths'} || '');
 	return (1, "SQLite path not configured for this profile") if (%ok && !$ok{$db});
+	if ($sqlite_sql || $src eq 'docker') {
+		my $cmd;
+		if ($src eq 'docker') {
+			$cmd = &docker_exec_prefix($p).' '.&sq(
+				'exec sqlite3 -readonly -batch -bail -cmd '.&sq('.timeout 5000').
+				' '.&sq($db).' '.&sq('.dump'));
+			}
+		else {
+			return (1, "SQLite file not found: $db") if (!-f $db || !-r $db);
+			my $sqlite = &engine_tool('sqlite', 'dump') || return (1, "sqlite3 not found on host");
+			$cmd = &sq($sqlite).' -readonly -batch -bail -cmd '.&sq('.timeout 5000').
+				' '.&sq($db).' '.&sq('.dump');
+			}
+		my ($f, $o, $e) = &run_cmd($cmd.' > '.&sq($raw), undef, 0);
+		return ($f, $e || $o) if ($f);
+		open(my $fh, '<', $raw) || return (1, "Could not read SQLite dump");
+		seek($fh, -64, 2) || seek($fh, 0, 0);
+		my $tail = join('', <$fh>);
+		close($fh);
+		return $tail =~ /(?:^|\n)COMMIT;\s*\z/ ? (0, undef) : (1, "SQLite dump did not commit");
+		}
 	return (1, "SQLite file not found: $db") if (!-r $db);
 	my $sqlite = &has_command('sqlite3') || return (1, "sqlite3 not found on host");
 	# An online ".backup" produces a consistent copy even while the DB is in use.
@@ -800,9 +827,56 @@ if ($eng eq 'sqlite') {
 return (1, "Unsupported database type: $eng");
 }
 
-# sqlite_label(PATH) - a distinguishing label for a SQLite file derived from its
-# location, so files that share a name (e.g. every site's "database.sqlite") do
-# not collide. Picks the hosting account / domain out of common layouts.
+sub valid_project_domain
+{
+my ($domain) = @_;
+return defined($domain) && length($domain) <= 253 &&
+	$domain =~ /\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\z/i;
+}
+
+# Read only the domain, home and assigned database names from Virtualmin metadata.
+sub virtualmin_projects
+{
+my $dir = "$config_directory/virtual-server/domains";
+opendir(my $dh, $dir) || return [];
+my @projects;
+foreach my $id (sort grep { /\A\d+\z/ } readdir($dh)) {
+	my %d;
+	&read_file("$dir/$id", \%d);
+	next if (!&valid_project_domain($d{'dom'}));
+	push(@projects, { domain => lc($d{'dom'}), home => $d{'home'},
+		mysql => [ split(/\s+/, $d{'db_mysql'} || '') ],
+		postgres => [ split(/\s+/, $d{'db_postgres'} || '') ] });
+	}
+closedir($dh);
+return [ sort { length($b->{'home'} || '') <=> length($a->{'home'} || '') } @projects ];
+}
+
+sub project_for_database
+{
+my ($p, $db, $projects) = @_;
+return lc($p->{'project_domain'}) if (&valid_project_domain($p->{'project_domain'}));
+return 'unassigned' if (($p->{'source'} || '') eq 'docker');
+my $type = $p->{'type'};
+if ($type eq 'sqlite') {
+	foreach my $project (@$projects) {
+		my $home = $project->{'home'};
+		return $project->{'domain'} if ($home && index($db, "$home/") == 0);
+		}
+	if ($db =~ m!\A(?:/home/[^/]+/domains|/var/www(?:/vhosts)?|/srv/(?:www|http))/([^/]+)/! &&
+	    &valid_project_domain($1)) {
+		return lc($1);
+		}
+	}
+elsif (!$p->{'host'} || $p->{'host'} =~ /\A(?:localhost|127\.0\.0\.1|::1)\z/) {
+	my $key = $type eq 'mariadb' ? 'mysql' : $type;
+	my @matches = grep { grep { $_ eq $db } @{$_->{$key} || []} } @$projects;
+	return $matches[0]->{'domain'} if (@matches == 1);
+	}
+return 'unassigned';
+}
+
+# Label a flat SQLite backup with its hosting account or domain when known.
 sub sqlite_label
 {
 my ($path) = @_;
@@ -821,13 +895,18 @@ return &safe_filename($label ne '' && $label ne $base ? $label."_".$base : $base
 # default output base name (before compression / encryption suffixes).
 sub dump_basename
 {
-my ($p, $db) = @_;
+my ($p, $db, $daily) = @_;
 my $eng = $p->{'type'};
 if ($eng eq 'mongodb') {
 	return &safe_filename(($db && $db ne '_all') ? $db : ($p->{'id'}.'_all')).'.archive';
 	}
 if ($eng eq 'sqlite') {
-	return &sqlite_label($db).'.sqlite';
+	if ($daily) {
+		(my $name = $db) =~ s!.*/!!;
+		$name =~ s/\.[^.]+$//;
+		return &safe_filename($name).'.sql';
+		}
+	return &sqlite_label($db).(($p->{'source'} || '') eq 'docker' ? '.sql' : '.sqlite');
 	}
 return &safe_filename($db).'.sql';
 }
@@ -939,7 +1018,63 @@ return sprintf($i ? "%.1f %s" : "%d %s", $n, $u[$i]);
 # Backup sets & retention
 # ----------------------------------------------------------------------------
 
-our $STAMP_RE = qr/^\d{4}-\d\d-\d\d_\d{6}(?:_[A-Za-z0-9_.\-]{1,64})?$/;
+our $DAILY_RE = qr/\A\d{4}-\d\d-\d\d\z/;
+our $STAMP_RE = qr/\A\d{4}-\d\d-\d\d(?:_\d{6}(?:_[A-Za-z0-9_.\-]{1,64})?)?\z/;
+
+# A date-only folder belongs to this module if it has a daily manifest.
+sub is_daily_set
+{
+my ($path, $day, $schedule_id) = @_;
+return 0 if (!$have_json || -l $path || !-f "$path/manifest.json" || -l "$path/manifest.json");
+open(my $fh, '<', "$path/manifest.json") || return 0;
+my $manifest = eval { local $/; JSON::PP::decode_json(<$fh>) };
+close($fh);
+return ref($manifest) eq 'HASH' && ($manifest->{'module'} || '') eq 'dbbackup' &&
+	($manifest->{'layout'} || '') eq 'daily' && ($manifest->{'created'} || '') eq $day &&
+	(!defined($schedule_id) || ($manifest->{'schedule'} || '') eq $schedule_id);
+}
+
+sub backup_set_path
+{
+my ($dir, $name) = @_;
+return undef if (!&valid_abs_path($dir) || !defined($name) || $name !~ $STAMP_RE);
+my $path = "$dir/$name";
+return undef if (-l $dir || -l $path || !-d $path);
+return undef if ($name =~ $DAILY_RE && !&is_daily_set($path, $name));
+return $path;
+}
+
+sub backup_file_path
+{
+my ($setdir, $name) = @_;
+return undef if (!$setdir || !defined($name) ||
+	$name !~ m!\A(?:[a-zA-Z0-9][a-zA-Z0-9.-]*/)?[a-zA-Z0-9_\x24-][a-zA-Z0-9_.\x24-]*\z!);
+if ($name =~ m!\A([^/]+)/!) {
+	return undef if (-l "$setdir/$1" || !-d "$setdir/$1");
+	}
+my $path = "$setdir/$name";
+return -f $path && !-l $path ? $path : undef;
+}
+
+sub backup_files
+{
+my ($setdir, $nested) = @_;
+opendir(my $dh, $setdir) || return ();
+my @names;
+foreach my $name (readdir($dh)) {
+	next if ($name =~ /\A(?:SHA256SUMS|manifest\.json|backup\.log)\z/);
+	if (&backup_file_path($setdir, $name)) {
+		push(@names, $name);
+		}
+	elsif ($nested && ($name eq 'unassigned' || &valid_project_domain($name)) &&
+	       !-l "$setdir/$name" && opendir(my $ph, "$setdir/$name")) {
+		push(@names, map { "$name/$_" } grep { &backup_file_path($setdir, "$name/$_") } readdir($ph));
+		closedir($ph);
+		}
+	}
+closedir($dh);
+return sort @names;
+}
 
 sub now_stamp { return strftime("%Y-%m-%d_%H%M%S", localtime()); }
 
@@ -949,24 +1084,16 @@ sub list_backup_sets
 my ($dir) = @_;
 return () if (!$dir || !-d $dir);
 opendir(my $dh, $dir) || return ();
-my @names = grep { $_ =~ $STAMP_RE && !-l "$dir/$_" && -d "$dir/$_" } readdir($dh);
+my @names = grep { &backup_set_path($dir, $_) } readdir($dh);
 closedir($dh);
 my @sets;
 foreach my $n (@names) {
 	my $path = "$dir/$n";
-	my ($bytes, $files) = (0, 0);
-	if (opendir(my $sd, $path)) {
-		foreach my $fn (readdir($sd)) {
-			next if ($fn eq '.' || $fn eq '..');
-			my $fp = "$path/$fn";
-			next if (!-f $fp);
-			$bytes += (-s $fp) || 0;
-			$files++ if ($fn !~ /^(manifest\.json|SHA256SUMS|backup\.log)$/);
-			}
-		closedir($sd);
-		}
+	my @files = &backup_files($path, $n =~ $DAILY_RE);
+	my $bytes = 0;
+	$bytes += (-s "$path/$_") || 0 foreach (@files);
 	push(@sets, { 'name' => $n, 'path' => $path,
-		'mtime' => (stat($path))[9], 'bytes' => $bytes, 'files' => $files });
+		'mtime' => (stat($path))[9], 'bytes' => $bytes, 'files' => scalar(@files) });
 	}
 return sort { $b->{'name'} cmp $a->{'name'} } @sets;   # newest first
 }
@@ -978,14 +1105,8 @@ sub safe_delete_set
 my ($dir, $name) = @_;
 return (1, "Invalid backup directory") if (!&valid_abs_path($dir));
 return (1, "Invalid backup set name") if ($name !~ $STAMP_RE);
-my $path = "$dir/$name";
-# Never follow a symlink into a deletion (-l uses lstat). A timestamp-named
-# symlink would otherwise let unlink_file recurse into the link's target.
-return (1, "Refusing to delete a symlinked backup set") if (-l $path);
-return (1, "Backup set not found") if (!-d $path);
-# Defence in depth: the resolved path must still live directly under $dir.
-return (1, "Refusing to delete outside the backup directory")
-	if (index($path, "$dir/") != 0 || $path =~ m!\.\.!);
+my $path = &backup_set_path($dir, $name);
+return (1, "Backup set not found") if (!$path);
 &unlink_file($path);     # Webmin's recursive delete
 return (-e $path) ? (1, "Could not remove $path") : (0, undef);
 }
@@ -993,9 +1114,9 @@ return (-e $path) ? (1, "Could not remove $path") : (0, undef);
 # apply_retention(DIR, COUNT, DAYS) -> (\@deleted, \@errors).
 sub apply_retention
 {
-my ($dir, $count, $days) = @_;
+my ($dir, $count, $days, $daily) = @_;
 my @deleted; my @errors;
-my @sets = &list_backup_sets($dir);     # newest first
+my @sets = grep { ($_->{'name'} =~ $DAILY_RE ? 1 : 0) == ($daily || 0) } &list_backup_sets($dir);     # newest first
 my %doomed;
 if (defined($count) && $count =~ /^\d+$/ && $count > 0 && @sets > $count) {
 	$doomed{$_->{'name'}} = 1 foreach (@sets[$count .. $#sets]);
@@ -1169,15 +1290,17 @@ my ($setdir, $stamp, $name, $base, $mode) = @_;
 &is_valid_id($name) || return (1, "Invalid remote name");
 &valid_remote_path($base) || return (1, "Invalid remote base path");
 return (1, "Invalid local set directory") if (!-d $setdir);
-$mode = ($mode && $mode eq 'sync') ? 'sync' : 'copy';
+$mode = ($stamp !~ $DAILY_RE && $mode && $mode eq 'sync') ? 'sync' : 'copy';
 my $dest = $name.':'.($base ne '' ? $base.'/' : '').$stamp;
 if ($mode eq 'sync') {
 	# Mirror the whole local backup tree (honours local retention on the remote).
 	my $parent = $setdir; $parent =~ s!/[^/]+/?$!!;
 	my $rbase = $name.':'.($base ne '' ? $base : '');
-	return &rclone_run('sync '.&sq($parent).' '.&sq($rbase).' --stats-one-line', 0);
+	return &rclone_run('sync '.&sq($parent).' '.&sq($rbase)." --exclude '/????-??-??/**' --exclude '/.dbbackup-*' --exclude '/.daily.lock' --stats-one-line", 0);
 	}
-return &rclone_run('copy '.&sq($setdir).' '.&sq($dest).' --stats-one-line', 0);
+my ($failed, $output) = &rclone_run('copy '.&sq($setdir).' '.&sq($dest).' --stats-one-line', 0);
+return ($failed, $output) if ($failed || $stamp !~ $DAILY_RE);
+return &rclone_run('check --one-way '.&sq($setdir).' '.&sq($dest), 1);
 }
 
 # ----------------------------------------------------------------------------
@@ -1204,7 +1327,18 @@ my $say = sub { push(@log, strftime("%H:%M:%S", localtime())." ".$_[0]); };
 
 my $dir = $job->{'dir'} || $config{'backup_dir'};
 &valid_abs_path($dir) || return (1, { 'log' => "Invalid backup directory: ".($dir||'') });
+$dir =~ s!/+\z!! if ($dir ne '/');
+my $daily = ($job->{'layout'} || '') eq 'daily' ? 1 : 0;
+if ($daily && ($dir eq '/' || -l $dir || !$have_json)) {
+	return (1, { log => "Daily backups require a dedicated, non-symlinked destination and JSON::PP" });
+	}
 &ensure_dir($dir, 0700);
+
+my $lock;
+if ($daily && (!sysopen($lock, "$dir/.daily.lock", O_CREAT | O_WRONLY | O_NOFOLLOW, 0600) ||
+	       !flock($lock, LOCK_EX | LOCK_NB))) {
+	return (1, { log => "Could not lock the daily backup destination" });
+	}
 
 # Free-space guard.
 my $need = defined($job->{'free_space_mb'}) ? $job->{'free_space_mb'} : $config{'free_space_mb'};
@@ -1215,12 +1349,25 @@ if ($need && $need =~ /^\d+$/) {
 		}
 	}
 
-my $stamp = &now_stamp();
-$stamp .= "_".&safe_filename($job->{'label'}) if (defined($job->{'label'}) && $job->{'label'} ne '');
-my $setdir = "$dir/$stamp";
-&make_dir($setdir, 0700);
-chmod(0700, $setdir);
-$say->("Backup set: $setdir");
+my $stamp = $daily ? strftime("%Y-%m-%d", localtime()) : &now_stamp();
+$stamp .= "_".&safe_filename($job->{'label'}) if (!$daily && defined($job->{'label'}) && $job->{'label'} ne '');
+my $final = "$dir/$stamp";
+my $reuse = $daily && &is_daily_set($final, $stamp, $job->{'label'} || '');
+my ($staging, $setdir);
+if ($daily && !$reuse) {
+	return (1, { log => "Daily destination already exists: $final" }) if (-e $final || -l $final);
+	$staging = eval { File::Temp->newdir('.dbbackup-XXXXXXXX', DIR => $dir) };
+	return (1, { log => "Could not create staging directory: $@" }) if (!$staging);
+	$setdir = "$staging";
+	}
+else {
+	$setdir = $final;
+	if (!$reuse) {
+		&make_dir($setdir, 0700);
+		chmod(0700, $setdir);
+		}
+	}
+$say->($reuse ? "Reusing completed backup: $final" : "Backup set: $final");
 
 my $comp  = $job->{'compression'} || $config{'compression'} || 'gzip';
 my $level = defined($job->{'level'}) ? $job->{'level'} : $config{'compress_level'};
@@ -1228,7 +1375,8 @@ my $sums  = (defined($job->{'checksum'}) ? $job->{'checksum'} : $config{'checksu
 my $enc   = $job->{'encrypt'} ? 1 : 0;
 
 my @items; my $failures = 0; my %used_names;
-foreach my $t (@{$job->{'targets'} || []}) {
+my $projects = $daily && !$reuse ? &virtualmin_projects() : [];
+foreach my $t ($reuse ? () : @{$job->{'targets'} || []}) {
 	my $p = &get_profile($t->{'profile'});
 	if (!$p) { $say->("Skipping unknown profile: ".($t->{'profile'}||'?')); $failures++; next; }
 	my $plabel = &profile_label($p);
@@ -1248,7 +1396,7 @@ foreach my $t (@{$job->{'targets'} || []}) {
 	foreach my $db (@dbs) {
 		my $shown = ($p->{'type'} eq 'sqlite') ? $db : ($db eq '_all' ? 'all databases' : $db);
 		my $raw = &transname();
-		my ($df, $de) = &dump_one($p, $db, $raw);
+		my ($df, $de) = &dump_one($p, $db, $raw, $daily);
 		if ($df) {
 			$say->("[$plabel] FAILED dumping $shown: ".&trim_err($de));
 			unlink($raw); $failures++;
@@ -1261,8 +1409,11 @@ foreach my $t (@{$job->{'targets'} || []}) {
 			push(@items, { profile => $p->{'id'}, db => $db, ok => 0, error => "empty dump" });
 			next;
 			}
-		my $base = &unique_basename(&dump_basename($p, $db), \%used_names);
-		my ($cf, $path, $ce) = &compress_raw($raw, $base, $setdir, $comp, $level);
+		my $project = $daily ? &project_for_database($p, $db, $projects) : '';
+		my $outdir = $project ne '' ? "$setdir/$project" : $setdir;
+		&ensure_dir($outdir, 0700) if ($daily && !-d $outdir);
+		my $base = &unique_basename(&dump_basename($p, $db, $daily), ($used_names{$project} ||= {}));
+		my ($cf, $path, $ce) = &compress_raw($raw, $base, $outdir, $comp, $level);
 		if ($cf) { $say->("[$plabel] compression failed for $shown: ".&trim_err($ce)); $failures++;
 			push(@items, { profile => $p->{'id'}, db => $db, ok => 0, error => &trim_err($ce) }); next; }
 		if ($enc) {
@@ -1273,20 +1424,37 @@ foreach my $t (@{$job->{'targets'} || []}) {
 			}
 		my $bytes = (-s $path) || 0;
 		my $sha = $sums ? &sha256_of($path) : undef;
+		if ($sums && !$sha) {
+			unlink($path); $failures++;
+			$say->("[$plabel] checksum failed for $shown");
+			next;
+			}
 		$say->("[$plabel] $shown -> ".&relname($path, $setdir)." (".&fmt_bytes($bytes).")");
 		push(@items, { profile => $p->{'id'}, engine => $p->{'type'}, db => $db,
 			file => &relname($path, $setdir), bytes => $bytes, sha256 => $sha, ok => 1 });
 		}
 	}
 
-# Write SHA256SUMS + manifest.
-if ($sums) {
-	open(my $sfh, ">", "$setdir/SHA256SUMS");
-	foreach my $it (@items) { next if (!$it->{'ok'} || !$it->{'sha256'});
-		print $sfh $it->{'sha256'}."  ".$it->{'file'}."\n"; }
-	close($sfh); chmod(0600, "$setdir/SHA256SUMS");
-	}
-&write_manifest($setdir, $stamp, \@items, $job);
+if (!$reuse) {
+	# Write SHA256SUMS + manifest.
+	if ($sums) {
+		if (open(my $sfh, ">", "$setdir/SHA256SUMS")) {
+			foreach my $it (@items) { next if (!$it->{'ok'} || !$it->{'sha256'});
+				print $sfh $it->{'sha256'}."  ".$it->{'file'}."\n"; }
+			$failures++ if (!close($sfh));
+			chmod(0600, "$setdir/SHA256SUMS");
+			}
+		else { $failures++; }
+		}
+	my $manifest_written = &write_manifest($setdir, $stamp, \@items, $job, $daily);
+	if ($daily) {
+		if ($failures || !$manifest_written || !@items || !rename($setdir, $final)) {
+			$say->("Daily backup was not published");
+			return (1, { log => join("\n", @log)."\n", items => \@items });
+			}
+		$setdir = $final;
+		}
+}
 
 # Cloud upload.
 my @uploads;
@@ -1297,7 +1465,7 @@ foreach my $rname (@remotes) {
 	$say->("Uploading to remote '$rname'...");
 	my ($uf, $uo) = &rclone_upload($setdir, $stamp, $rname,
 		(defined($job->{'remote_base'}) ? $job->{'remote_base'} : $config{'remote_base'}),
-		$job->{'remote_mode'} || $config{'remote_mode'});
+		$daily ? 'copy' : ($job->{'remote_mode'} || $config{'remote_mode'}));
 	if ($uf) { $say->("Upload to '$rname' FAILED: ".&trim_err($uo)); $failures++; }
 	else { $say->("Upload to '$rname' complete"); }
 	push(@uploads, { remote => $rname, ok => $uf ? 0 : 1, output => &trim_err($uo) });
@@ -1306,17 +1474,17 @@ foreach my $rname (@remotes) {
 # Retention.
 my $rc = defined($job->{'retain_count'}) ? $job->{'retain_count'} : $config{'retain_count'};
 my $rd = defined($job->{'retain_days'})  ? $job->{'retain_days'}  : $config{'retain_days'};
-my ($deleted, $rerr) = &apply_retention($dir, $rc, $rd);
+my ($deleted, $rerr) = $daily && $failures ? ([], []) : &apply_retention($dir, $rc, $rd, $daily);
 $say->("Retention removed ".scalar(@$deleted)." old set(s)") if (@$deleted);
 $say->("Retention error: $_") foreach (@$rerr);
 $failures++ if (@$rerr);
 
-my $ok = ($failures == 0 && grep { $_->{'ok'} } @items) ? 1 : 0;
+my $ok = ($failures == 0 && ($reuse || grep { $_->{'ok'} } @items)) ? 1 : 0;
 $say->($ok ? "Backup completed successfully" :
 	($failures ? "Backup completed with $failures error(s)" : "Nothing was backed up"));
 
 my $logtext = join("\n", @log)."\n";
-return (($failures ? 1 : 0), {
+return (($ok ? 0 : 1), {
 	'ok' => $ok, 'stamp' => $stamp, 'setdir' => $setdir,
 	'items' => \@items, 'deleted' => $deleted, 'uploads' => \@uploads, 'log' => $logtext });
 }
@@ -1335,11 +1503,13 @@ sub relname { my ($p, $d) = @_; (my $r = $p) =~ s!^\Q$d\E/!!; return $r; }
 
 sub write_manifest
 {
-my ($setdir, $stamp, $items, $job) = @_;
-return if (!$have_json);
+my ($setdir, $stamp, $items, $job, $daily) = @_;
+return 0 if (!$have_json);
 my %m = (
 	'module'      => 'dbbackup',
 	'created'     => $stamp,
+	'layout'      => $daily ? 'daily' : 'timestamped',
+	($daily ? (schedule => $job->{'label'}) : ()),
 	'host'        => &get_system_hostname(),
 	'compression' => ($job->{'compression'} || $config{'compression'}),
 	'encrypted'   => ($job->{'encrypt'} ? JSON::PP::true() : JSON::PP::false()),
@@ -1348,8 +1518,9 @@ my %m = (
 my $f = "$setdir/manifest.json";
 open(my $fh, ">", $f) || return;
 print $fh JSON::PP->new->pretty->canonical->encode(\%m);
-close($fh);
+my $written = close($fh);
 chmod(0600, $f);
+return $written;
 }
 
 # ----------------------------------------------------------------------------
@@ -1498,6 +1669,7 @@ elsif ($eng eq 'mongodb') {
 		}
 	}
 elsif ($eng eq 'sqlite') {
+	if ($src eq 'docker') { unlink(@cleanup); return (1, "Restore Docker SQLite dumps with sqlite3 inside the container"); }
 	if (!&valid_abs_path($target)) { unlink(@cleanup); return (1, "A valid target SQLite file path is required"); }
 	# A restore must not be a write-anywhere primitive: the target must be one
 	# of the paths the profile already declares, and never a symlink.
@@ -1591,6 +1763,7 @@ return {
 	'targets'      => \@targets,
 	'dir'          => $s->{'dir'} || $config{'backup_dir'},
 	'label'        => $s->{'id'},
+	'layout'       => $s->{'layout'},
 	'compression'  => $s->{'compression'} || $config{'compression'},
 	'level'        => &$orblank($s->{'level'}, $config{'compress_level'}),
 	'encrypt'      => $s->{'encrypt'} ? 1 : 0,

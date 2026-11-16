@@ -6,7 +6,7 @@
 require './dbbackup-lib.pl';
 &ReadParse();
 
-our (%config, %text, %in, %access);
+our (%config, %text, %in, %access, $DAILY_RE);
 %access = &get_module_acl();
 
 my $dir = $config{'backup_dir'};
@@ -15,11 +15,10 @@ my $dir = $config{'backup_dir'};
 if (defined($in{'download'}) && defined($in{'set'})) {
 	my $set  = $in{'set'};
 	my $file = $in{'download'};
-	&error($text{'err_badpath'}) if ($set !~ $STAMP_RE);
-	&error($text{'err_badpath'}) if ($file !~ /^[A-Za-z0-9][A-Za-z0-9_.\-]*$/);
-	my $path = "$dir/$set/$file";
-	&error($text{'err_badpath'}) if (index($path, "$dir/") != 0 || $path =~ /\.\./);
-	&error($text{'err_nofile'}) if (!-f $path);
+	my $sdir = &backup_set_path($dir, $set);
+	my $path = &backup_file_path($sdir, $file);
+	&error($text{'err_nofile'}) if (!$path);
+	$file =~ s!.*/!!;
 	my $size = (-s $path) || 0;
 	print "Content-type: application/octet-stream\n";
 	print "Content-Disposition: attachment; filename=\"$file\"\n";
@@ -40,14 +39,14 @@ print &ui_alert_box(&html_escape($in{'err'}), 'danger') if ($in{'err'});
 print "<p>".&text('dash_dest', "<tt>".&html_escape($dir)."</tt>")."</p>";
 
 # ---- Single set view -------------------------------------------------------
-if ($in{'set'} && $in{'set'} =~ $STAMP_RE && -d "$dir/$in{'set'}") {
-	my $set  = $in{'set'};
-	my $sdir = "$dir/$set";
+if (my $sdir = &backup_set_path($dir, $in{'set'})) {
+	my $set = $in{'set'};
 	print &ui_subheading(&html_escape($set));
 
 	# Load recorded checksums.
 	my %sums;
-	if (open(my $sf, "<", "$sdir/SHA256SUMS")) {
+	my $sumfile = &backup_file_path($sdir, 'SHA256SUMS');
+	if ($sumfile && open(my $sf, "<", $sumfile)) {
 		while (my $l = <$sf>) { $sums{$2} = $1 if ($l =~ /^(\S+)\s+(.+?)\s*$/); }
 		close($sf);
 		}
@@ -56,14 +55,13 @@ if ($in{'set'} && $in{'set'} =~ $STAMP_RE && -d "$dir/$in{'set'}") {
 	my %verify;
 	if ($in{'verify'}) {
 		foreach my $fn (keys %sums) {
-			my $got = &sha256_of("$sdir/$fn");
+			my $path = &backup_file_path($sdir, $fn);
+			my $got = $path ? &sha256_of($path) : undef;
 			$verify{$fn} = (defined($got) && $got eq $sums{$fn}) ? 'ok' : 'bad';
 			}
 		}
 
-	opendir(my $dh, $sdir);
-	my @files = sort grep { -f "$sdir/$_" && $_ !~ /^(SHA256SUMS|manifest\.json|backup\.log)$/ } readdir($dh);
-	closedir($dh);
+	my @files = &backup_files($sdir, $set =~ $DAILY_RE);
 
 	print &ui_columns_start([ $text{'browse_file'}, $text{'browse_size'},
 		$text{'browse_sha'}, $text{'browse_actions'} ], 100);

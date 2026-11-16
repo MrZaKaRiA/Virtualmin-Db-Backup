@@ -11,7 +11,7 @@ and **scheduled jobs**. It **detects what's already on your system** so you clic
 [![License: GPL v2](https://img.shields.io/badge/License-GPLv2-blue.svg)](LICENSE)
 [![Webmin module](https://img.shields.io/badge/Webmin-module-FF6600.svg)](https://webmin.com)
 [![Virtualmin](https://img.shields.io/badge/Virtualmin-friendly-2E7D32.svg)](https://virtualmin.com)
-[![Version](https://img.shields.io/badge/version-1.0.0-success.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.1.0-success.svg)](CHANGELOG.md)
 [![Hardened](https://img.shields.io/badge/secrets-never--on--argv-brightgreen.svg)](#-security-model)
 
 </div>
@@ -164,6 +164,36 @@ tar -czf dbbackup.wbm.gz dbbackup     # the top-level dir in the archive must be
     SHA256SUMS
     manifest.json
 ```
+
+### Daily folders by project domain
+
+In **Schedules**, choose **Daily folders by project domain** under **Backup layout**,
+select the connection profiles, and use a dedicated destination such as
+`/home/DatabaseBackup`. Set **Base folder/path on the remote** in the module settings
+to mirror the root folder name on Dropbox.
+
+```text
+DatabaseBackup/
+  2026-11-16/
+    app.example.test/
+      app.sql.gz
+    shop.example.test/
+      orders.sql.gz
+    SHA256SUMS
+    manifest.json
+```
+
+Virtualmin's local database assignments and site home directories supply the
+domain names. Set **Project domain or subdomain** on Docker profiles and other
+connections that need an explicit mapping. Databases with no match go into
+`unassigned`. Add SQLite files to a connection profile. For SQLite inside Docker,
+specify the paths inside the running container and make sure it has `sqlite3`.
+Daily SQLite backups are SQL dumps.
+
+Use one daily schedule per destination. The server's local date determines the
+folder name. A rerun of the same schedule reuses that day's completed local set
+and retries the cloud copy. Daily uploads use rclone copy and verification.
+Local retention applies to completed daily sets.
 
 ## ☁️ Cloud remotes
 

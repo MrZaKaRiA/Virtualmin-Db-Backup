@@ -3,4 +3,4 @@ desc=Database Backup
 category=servers
 longdesc=Back up MySQL, MariaDB, PostgreSQL, MongoDB and SQLite databases (host-installed or inside Docker containers), with compression, integrity checksums, retention, optional encryption, cloud upload (S3 / Dropbox / Google Drive via rclone) and scheduled jobs.
 os_support=*-linux
-version=1.0.0
+version=1.1.0
